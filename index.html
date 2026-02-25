@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spelling Practice</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 760px; margin: 24px auto; padding: 0 12px; }
+    textarea, input, select, button { font-size: 16px; }
+    textarea { width: 100%; height: 140px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 12px; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    .muted { color: #666; }
+    button { padding: 8px 12px; cursor: pointer; }
+    input[type="text"] { width: 100%; padding: 10px; margin-top: 6px; }
+    .small { font-size: 13px; }
+    #answer { flex: 1; min-width: 220px; margin-top: 0; }
+    .timerBox { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
+    .timerStat b { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <h1>Spelling Practice</h1>
+
+  <!-- Setup / Word list -->
+  <div class="card">
+    <div class="row" style="justify-content: space-between;">
+      <div>
+        <div class="muted small">Paste words (one per line). Update weekly.</div>
+      </div>
+      <div class="row">
+        <button id="loadExample" type="button">Load Example</button>
+        <button id="saveList" type="button">Save</button>
+      </div>
+    </div>
+
+    <div id="wordListContainer">
+      <textarea id="wordList" placeholder="one per line&#10;because&#10;friend&#10;beautiful"></textarea>
+    </div>
+
+    <button id="editList" type="button" style="display:none; margin-top:8px;">
+      ✏️ Edit word list
+    </button>
+
+    <div class="row" style="margin-top:10px;">
+      <label class="small">Voice:
+        <select id="voiceSelect"></select>
+      </label>
+
+      <label class="small">Rate:
+        <input id="rate" type="range" min="0.6" max="1.2" step="0.05" value="0.95">
+        <span id="rateVal" class="small">0.95</span>
+      </label>
+
+      <label class="small">Repeat:
+        <input id="repeatCount" type="number" min="1" max="3" value="1" style="width:60px;">
+      </label>
+
+      <label class="small">
+        <input id="hideWord" type="checkbox" checked>
+        Don’t show word
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button id="start" type="button">Start</button>
+      <button id="shuffle" type="button">Shuffle</button>
+      <button id="resetRun" type="button">Reset timer</button>
+      <button id="clearProgress" type="button">Clear progress</button>
+      <span class="muted small" id="status"></span>
+    </div>
+
+    <div class="timerBox" style="margin-top:10px;">
+      <div class="timerStat small muted">Time: <b id="timeNow">00:00.0</b></div>
+      <div class="timerStat small muted">Best: <b id="timeBest">—</b></div>
+    </div>
+  </div>
+
+  <!-- Practice -->
+  <div class="card">
+    <div class="row">
+      <button id="speak" type="button">🔊 Speak</button>
+      <button id="repeat" type="button">Repeat</button>
+      <button id="reveal" type="button">Reveal</button>
+      <button id="skip" type="button">Skip</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted small">Type the word you hear:</div>
+
+      <div class="row" style="margin-top:6px;">
+        <input id="answer" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <button id="checkBtn" type="button">✅ Check</button>
+      </div>
+
+      <div id="feedback" style="margin-top:8px;"></div>
+      <div class="muted small" id="progress"></div>
+      <div class="muted small" id="currentWord" style="margin-top:6px;"></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const el = (id) => document.getElementById(id);
+
+  const wordListEl = el("wordList");
+  const wordListContainer = el("wordListContainer");
+  const editListBtn = el("editList");
+
+  const voiceSelect = el("voiceSelect");
+  const rate = el("rate");
+  const rateVal = el("rateVal");
+  const repeatCountEl = el("repeatCount");
+  const hideWordEl = el("hideWord");
+
+  const statusEl = el("status");
+  const progressEl = el("progress");
+  const currentWordEl = el("currentWord");
+  const feedbackEl = el("feedback");
+  const answerEl = el("answer");
+
+  const timeNowEl = el("timeNow");
+  const timeBestEl = el("timeBest");
+
+  let words = [];
+  let idx = 0;
+  let voices = [];
+
+  // --- Storage keys ---
+  const STORAGE_KEY = "spelling_words_v2";
+  const PROGRESS_KEY = "spelling_progress_v2";
+
+  // Timer/best are per-list so "best time" resets when you change the list
+  function listSignature(text) {
+    // Normalize list text so small whitespace doesn't change the signature too much
+    return text.trim().split(/\r?\n/).map(s => s.trim()).filter(Boolean).join("\n").toLowerCase();
+  }
+  function hashString(str) {
+    // Simple non-crypto hash for localStorage keying
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16);
+  }
+  function bestKeyForCurrentList() {
+    return "spelling_best_ms_" + hashString(listSignature(wordListEl.value || ""));
+  }
+
+  // --- Timer state ---
+  let runStarted = false;
+  let startMs = 0;
+  let elapsedMs = 0;
+  let timerInterval = null;
+
+  function formatMs(ms) {
+    const totalSeconds = ms / 1000;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.floor(totalSeconds % 60);
+    const tenths = Math.floor((ms % 1000) / 100);
+    const mm = String(minutes).padStart(2, "0");
+    const ss = String(seconds).padStart(2, "0");
+    return `${mm}:${ss}.${tenths}`;
+  }
+
+  function updateTimerDisplay() {
+    const ms = runStarted ? (Date.now() - startMs) : elapsedMs;
+    timeNowEl.textContent = formatMs(ms);
+  }
+
+  function loadBestTime() {
+    const key = bestKeyForCurrentList();
+    const best = localStorage.getItem(key);
+    timeBestEl.textContent = best ? formatMs(Number(best)) : "—";
+  }
+
+  function startTimerIfNeeded() {
+    if (runStarted) return;
+    runStarted = true;
+    startMs = Date.now() - elapsedMs;
+
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(updateTimerDisplay, 100);
+    updateTimerDisplay();
+  }
+
+  function stopTimer() {
+    if (!runStarted) return;
+    elapsedMs = Date.now() - startMs;
+    runStarted = false;
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = null;
+    updateTimerDisplay();
+  }
+
+  function resetTimer() {
+    runStarted = false;
+    startMs = 0;
+    elapsedMs = 0;
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = null;
+    updateTimerDisplay();
+  }
+
+  function maybeSaveBest(finalMs) {
+    const key = bestKeyForCurrentList();
+    const currentBest = Number(localStorage.getItem(key) || "0");
+    if (!currentBest || finalMs < currentBest) {
+      localStorage.setItem(key, String(finalMs));
+      loadBestTime();
+      return true;
+    }
+    return false;
+  }
+
+  // --- Persistence (list + progress) ---
+  function saveList() {
+    localStorage.setItem(STORAGE_KEY, wordListEl.value);
+
+    // Hide word list after saving
+    wordListContainer.style.display = "none";
+    editListBtn.style.display = "inline-block";
+
+    // New list means a new "best" bucket (best is keyed by list signature)
+    loadBestTime();
+    statusEl.textContent = "Saved.";
+    setTimeout(() => statusEl.textContent = "", 1200);
+  }
+
+  function loadList() {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) wordListEl.value = saved;
+  }
+
+  function saveProgress() {
+    localStorage.setItem(PROGRESS_KEY, JSON.stringify({ idx }));
+  }
+
+  function loadProgress() {
+    const saved = localStorage.getItem(PROGRESS_KEY);
+    if (saved) {
+      try { idx = Math.max(0, JSON.parse(saved).idx || 0); } catch {}
+    }
+  }
+
+  // --- TTS ---
+  function populateVoices() {
+    voices = window.speechSynthesis.getVoices() || [];
+    voiceSelect.innerHTML = "";
+    voices.forEach((v, i) => {
+      const opt = document.createElement("option");
+      opt.value = i;
+      opt.textContent = `${v.name} (${v.lang})`;
+      voiceSelect.appendChild(opt);
+    });
+
+    const preferred = voices.findIndex(v => (v.lang || "").toLowerCase().startsWith("en"));
+    if (preferred >= 0) voiceSelect.value = preferred;
+  }
+
+  function speakText(text) {
+    if (!("speechSynthesis" in window)) {
+      alert("Sorry—this browser doesn’t support Text-to-Speech (speechSynthesis). Try Chrome/Edge/Safari.");
+      return;
+    }
+    if (!text) return;
+
+    // Starting the timer on first interaction can feel nice.
+    // If you only want timer to start on first correct answer, remove the next line.
+    startTimerIfNeeded();
+
+    window.speechSynthesis.cancel();
+
+    const utter = new SpeechSynthesisUtterance(text);
+    const v = voices[Number(voiceSelect.value)];
+    if (v) utter.voice = v;
+    utter.rate = Number(rate.value);
+
+    const repeatCount = Math.max(1, Math.min(3, Number(repeatCountEl.value || 1)));
+    let said = 0;
+
+    utter.onend = () => {
+      said++;
+      if (said < repeatCount) window.speechSynthesis.speak(utter);
+    };
+
+    window.speechSynthesis.speak(utter);
+  }
+
+  if ("speechSynthesis" in window) {
+    populateVoices();
+    window.speechSynthesis.onvoiceschanged = populateVoices;
+  }
+
+  // --- Quiz logic ---
+  function parseWords() {
+    words = wordListEl.value
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+
+  function showState() {
+    progressEl.textContent = words.length
+      ? `Word ${idx + 1} of ${words.length}`
+      : "Add some words above, then click Start.";
+
+    currentWordEl.textContent = (!hideWordEl.checked && words[idx])
+      ? `Current word: ${words[idx]}`
+      : "";
+
+    feedbackEl.textContent = "";
+    answerEl.value = "";
+    answerEl.focus();
+  }
+
+  function start() {
+    parseWords();
+    if (!words.length) {
+      alert("Paste at least one word (one per line).");
+      return;
+    }
+    loadProgress();
+    idx = Math.min(idx, words.length - 1);
+
+    // Reset timer for a new run (common expectation when you press Start)
+    resetTimer();
+    loadBestTime();
+
+    showState();
+  }
+
+  function shuffleWords() {
+    parseWords();
+    for (let i = words.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [words[i], words[j]] = [words[j], words[i]];
+    }
+    idx = 0;
+
+    resetTimer();
+    loadBestTime();
+
+    showState();
+  }
+
+  function current() {
+    return words[idx] || "";
+  }
+
+  function normalize(s) {
+    return (s || "").trim().toLowerCase();
+  }
+
+  function finishRun() {
+    stopTimer();
+    const finalMs = elapsedMs;
+    const isNewBest = maybeSaveBest(finalMs);
+
+    feedbackEl.innerHTML = `
+      <span class="ok">🎉 Done!</span>
+      <span class="muted small">Time: <b>${formatMs(finalMs)}</b>${isNewBest ? " — <b>NEW BEST!</b>" : ""}</span>
+    `;
+    progressEl.textContent = `Completed all ${words.length} words.`;
+    currentWordEl.textContent = "";
+  }
+
+  function check() {
+    const target = normalize(current());
+    const typed = normalize(answerEl.value);
+
+    if (!target) return;
+
+    // Start timer on first attempt (if not already started)
+    startTimerIfNeeded();
+
+    if (typed === target) {
+      feedbackEl.innerHTML = `<span class="ok">✅ Correct!</span>`;
+      idx++;
+      saveProgress();
+
+      if (idx >= words.length) {
+        finishRun();
+        return;
+      }
+      setTimeout(showState, 350);
+    } else {
+      feedbackEl.innerHTML =
+        `<span class="bad">❌ Try again.</span> <span class="muted small">(Press Reveal if needed.)</span>`;
+      answerEl.focus();
+      answerEl.select();
+    }
+  }
+
+  function reveal() {
+    if (!current()) return;
+    feedbackEl.innerHTML = `<span class="muted">Answer:</span> <b>${current()}</b>`;
+  }
+
+  function skip() {
+    if (!words.length) return;
+    idx = Math.min(words.length - 1, idx + 1);
+    saveProgress();
+    showState();
+  }
+
+  // --- Wire up UI ---
+  el("start").addEventListener("click", start);
+  el("shuffle").addEventListener("click", shuffleWords);
+  el("saveList").addEventListener("click", saveList);
+  el("resetRun").addEventListener("click", () => {
+    resetTimer();
+    feedbackEl.textContent = "";
+    answerEl.focus();
+  });
+  el("clearProgress").addEventListener("click", () => {
+    localStorage.removeItem(PROGRESS_KEY);
+    idx = 0;
+    resetTimer();
+    feedbackEl.textContent = "";
+    showState();
+  });
+
+  el("speak").addEventListener("click", () => speakText(current()));
+  el("repeat").addEventListener("click", () => speakText(current()));
+  el("reveal").addEventListener("click", reveal);
+  el("skip").addEventListener("click", skip);
+
+  el("checkBtn").addEventListener("click", check);
+
+  rate.addEventListener("input", () => rateVal.textContent = rate.value);
+
+  answerEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") check();
+  });
+
+  hideWordEl.addEventListener("change", showState);
+
+  editListBtn.addEventListener("click", () => {
+    wordListContainer.style.display = "block";
+    editListBtn.style.display = "none";
+  });
+
+  el("loadExample").addEventListener("click", () => {
+    wordListEl.value = ["because","friend","beautiful","through","enough"].join("\n");
+    saveList();
+  });
+
+  // init
+  loadList();
+  rateVal.textContent = rate.value;
+
+  // Auto-hide list on load if a list exists
+  if (localStorage.getItem(STORAGE_KEY)) {
+    wordListContainer.style.display = "none";
+    editListBtn.style.display = "inline-block";
+  }
+
+  parseWords();
+  loadBestTime();
+  resetTimer();
+  showState();
+})();
+</script>
+</body>
+</html>
